@@ -1,7 +1,8 @@
 const SPENDINGS_ALLEGRO_WEBAPI_URL = "http://34.116.163.207:8086/api/allegro/emails/raw";
-const ALLEGRO_SUBJECT_PREFIXES = ["Kupiłeś i zapłaciłeś:", "Zapłaciłeś"];
-// Gmail search that pre-filters Allegro purchase threads server-side (prefixes are re-checked in code).
-const ALLEGRO_INBOX_QUERY = 'in:inbox subject:("Kupiłeś i zapłaciłeś" OR "Zapłaciłeś")';
+// Purchase notifications ("Kupiłeś i zapłaciłeś: ...", "Zapłaciłeś ...") and refunds ("Zwrot 64,58 zł za zakup ...").
+const ALLEGRO_SUBJECT_PREFIXES = ["Kupiłeś i zapłaciłeś:", "Zapłaciłeś", "Zwrot "];
+// Gmail search that pre-filters Allegro threads server-side (prefixes are re-checked in code).
+const ALLEGRO_INBOX_QUERY = 'in:inbox subject:("Kupiłeś i zapłaciłeś" OR "Zapłaciłeś" OR "Zwrot")';
 const LABEL_IMPORTED = "FE-Imported";
 const LABEL_PROCESSED = "FE-Processed";
 const SEARCH_PAGE_SIZE = 500;
@@ -13,7 +14,7 @@ const MAX_LISTING_MS = 4.5 * 60 * 1000;
 // Historical behaviour of this mailbox: every non-Allegro Inbox thread is labelled FE-Processed and archived too.
 const ARCHIVE_NON_ALLEGRO_THREADS = true;
 // Server-side pre-filter for the non-Allegro clean-up (the exact prefix check is still done in code).
-const NON_ALLEGRO_INBOX_QUERY = 'in:inbox -subject:("Kupiłeś i zapłaciłeś" OR "Zapłaciłeś")';
+const NON_ALLEGRO_INBOX_QUERY = 'in:inbox -subject:("Kupiłeś i zapłaciłeś" OR "Zapłaciłeś" OR "Zwrot")';
 const ARCHIVE_BATCH_SIZE = 100;
 
 /**
