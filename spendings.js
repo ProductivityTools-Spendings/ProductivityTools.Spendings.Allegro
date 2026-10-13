@@ -8,9 +8,9 @@ const SEARCH_PAGE_SIZE = 500;
 const INBOX_PAGE_SIZE = 100;
 // Apps Script kills the execution after 6 minutes; stop cleanly before that and continue on the next run.
 const MAX_RUNTIME_MS = 5 * 60 * 1000;
-// Pass 1 (listing) must leave time for actually sending e-mails; if listing takes longer we still proceed
-// with what was collected (the oldest-first order is then only guaranteed within the collected part).
-const MAX_LISTING_MS = 2 * 60 * 1000;
+// Pass 1 (listing) budget. Chronological order is guaranteed ONLY when the whole Inbox was listed,
+// so when this budget is hit nothing is sent at all (see exportAllegroEmailsToSpendingsApi).
+const MAX_LISTING_MS = 4.5 * 60 * 1000;
 // Historical behaviour of this mailbox: every non-Allegro Inbox thread is labelled FE-Processed and archived too.
 const ARCHIVE_NON_ALLEGRO_THREADS = true;
 // Upper bound of non-Allegro threads archived per run (each batch of 100 costs 2 Gmail calls).
@@ -25,7 +25,10 @@ const MAX_OTHERS_ARCHIVED_PER_RUN = 1000;
  * - Pass 2: in date order reads the message, POSTs it and archives the thread immediately,
  *   so progress is kept even if the run is cut short.
  * - Stops at the first failed request: continuing would insert newer e-mails before an older one.
- * - Stops before the execution time limit; simply run again to continue.
+ * - Stops before the execution time limit; simply run again to continue. Everything left in the Inbox
+ *   is newer than everything already sent, so the next run continues the chronology seamlessly.
+ * - If the listing itself could not be completed within the budget NOTHING is sent - a partial listing
+ *   could not guarantee that the oldest e-mail is really the oldest one.
  * - Non-Allegro Inbox threads are archived only after all Allegro e-mails are gone (and in a bounded amount),
  *   so a big Inbox can never starve the actual export.
  */
@@ -38,6 +41,13 @@ function exportAllegroEmailsToSpendingsApi() {
   var allegro = listing.threads;
   console.log("Found", allegro.length, "Allegro threads in Inbox (listing took",
     Math.round((Date.now() - startedAt) / 1000), "s" + (listing.complete ? "" : ", INCOMPLETE - time budget hit") + ").");
+
+  if (!listing.complete) {
+    console.error("Listing did not finish within the time budget - nothing was sent, because the chronological",
+      "order can only be guaranteed after seeing every Allegro e-mail in the Inbox. Run the script again",
+      "(Gmail caches the search, the second listing is usually much faster).");
+    return;
+  }
 
   if (allegro.length === 0) {
     console.log("No Allegro purchase e-mails in Inbox.");
@@ -62,8 +72,8 @@ function exportAllegroEmailsToSpendingsApi() {
     var item = allegro[i];
     var message = item.thread.getMessages()[0];
     item.messageId = message.getId();
-    item.date = message.getDate().getTime();
     item.message = message;
+    item.emailDate = message.getDate().getTime();
     if (!sendAllegroEmailToSpendingsApi(item)) {
       stoppedReason = "failed request";
       break;
@@ -81,8 +91,6 @@ function exportAllegroEmailsToSpendingsApi() {
   if (stoppedReason) {
     console.warn("Stopped early (" + stoppedReason + "). Sent", sent, "of", allegro.length,
       "- the rest stays in Inbox, run the script again to continue.");
-  } else if (!listing.complete) {
-    console.warn("All collected e-mails sent, but the listing was incomplete - run the script again.");
   }
   console.log("Done. Allegro e-mails sent:", sent, "/", allegro.length);
 }
@@ -107,12 +115,17 @@ function collectAllegroThreads(startedAt) {
       if (!isAllegroPurchaseSubject(subject)) {
         continue;
       }
+      // Purchase notifications are single-message threads, so the last message date (free, part of the
+      // listing) is the e-mail date. Only for the rare multi-message thread we pay for a message fetch,
+      // because there the first message - the one we send - is older than the thread's last message.
+      var date = thread.getMessageCount() > 1
+        ? thread.getMessages()[0].getDate().getTime()
+        : thread.getLastMessageDate().getTime();
       result.push({
         thread: thread,
         threadId: thread.getId(),
         subject: subject,
-        // purchase notifications are single-message threads, so the last message date is the e-mail date
-        date: thread.getLastMessageDate().getTime()
+        date: date
       });
     }
     start += threads.length;
@@ -143,7 +156,7 @@ function sendAllegroEmailToSpendingsApi(item) {
     messageId: item.messageId,
     threadId: item.threadId,
     subject: item.subject,
-    emailDate: new Date(item.date).toISOString(),
+    emailDate: new Date(item.emailDate).toISOString(),
     rawHtml: item.message.getBody()
   };
 
@@ -157,7 +170,7 @@ function sendAllegroEmailToSpendingsApi(item) {
   var response = UrlFetchApp.fetch(SPENDINGS_ALLEGRO_WEBAPI_URL, options);
   var responseCode = response.getResponseCode();
   if (responseCode >= 200 && responseCode < 300) {
-    console.log("Sent:", new Date(item.date).toISOString(), item.messageId, item.subject);
+    console.log("Sent:", new Date(item.emailDate).toISOString(), item.messageId, item.subject);
     return true;
   }
   console.error("Failed to send Allegro email. Status:", responseCode, "Body:", response.getContentText(),
