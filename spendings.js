@@ -5,7 +5,6 @@ const ALLEGRO_INBOX_QUERY = 'in:inbox subject:("Kupiłeś i zapłaciłeś" OR "Z
 const LABEL_IMPORTED = "FE-Imported";
 const LABEL_PROCESSED = "FE-Processed";
 const SEARCH_PAGE_SIZE = 500;
-const INBOX_PAGE_SIZE = 100;
 // Apps Script kills the execution after 6 minutes; stop cleanly before that and continue on the next run.
 const MAX_RUNTIME_MS = 5 * 60 * 1000;
 // Pass 1 (listing) budget. Chronological order is guaranteed ONLY when the whole Inbox was listed,
@@ -13,13 +12,17 @@ const MAX_RUNTIME_MS = 5 * 60 * 1000;
 const MAX_LISTING_MS = 4.5 * 60 * 1000;
 // Historical behaviour of this mailbox: every non-Allegro Inbox thread is labelled FE-Processed and archived too.
 const ARCHIVE_NON_ALLEGRO_THREADS = true;
-// Upper bound of non-Allegro threads archived per run (each batch of 100 costs 2 Gmail calls).
-const MAX_OTHERS_ARCHIVED_PER_RUN = 1000;
+// Server-side pre-filter for the non-Allegro clean-up (the exact prefix check is still done in code).
+const NON_ALLEGRO_INBOX_QUERY = 'in:inbox -subject:("Kupiłeś i zapłaciłeś" OR "Zapłaciłeś")';
+const ARCHIVE_BATCH_SIZE = 100;
 
 /**
  * Sends Allegro purchase e-mails from the Inbox to the Spendings WebApi strictly oldest-first,
  * so that ids in the database follow the e-mail chronology.
  *
+ * - Step 0: archives every non-Allegro Inbox thread first (order is irrelevant there, so it is done in
+ *   batches of 100 straight from a Gmail search). Only when the Inbox contains nothing but Allegro
+ *   purchase e-mails the export starts; if the clean-up alone eats the time budget, run again.
  * - Pass 1 (cheap): Gmail search limited to Allegro subjects, 500 threads per page; uses only thread
  *   metadata that comes with the listing (id, subject, last message date) - no per-thread message fetch.
  * - Pass 2: in date order reads the message, POSTs it and archives the thread immediately,
@@ -29,13 +32,20 @@ const MAX_OTHERS_ARCHIVED_PER_RUN = 1000;
  *   is newer than everything already sent, so the next run continues the chronology seamlessly.
  * - If the listing itself could not be completed within the budget NOTHING is sent - a partial listing
  *   could not guarantee that the oldest e-mail is really the oldest one.
- * - Non-Allegro Inbox threads are archived only after all Allegro e-mails are gone (and in a bounded amount),
- *   so a big Inbox can never starve the actual export.
  */
 function exportAllegroEmailsToSpendingsApi() {
   var startedAt = Date.now();
   var labelImported = GmailApp.getUserLabelByName(LABEL_IMPORTED);
   var labelProcessed = GmailApp.getUserLabelByName(LABEL_PROCESSED);
+
+  if (ARCHIVE_NON_ALLEGRO_THREADS) {
+    var cleanup = archiveNonAllegroInboxThreads(labelProcessed, startedAt);
+    if (!cleanup.complete) {
+      console.warn("Time budget spent on archiving non-Allegro threads (" + cleanup.archived + " archived).",
+        "Run the script again - the Allegro export starts once the Inbox is clean.");
+      return;
+    }
+  }
 
   var listing = collectAllegroThreads(startedAt);
   var allegro = listing.threads;
@@ -51,9 +61,6 @@ function exportAllegroEmailsToSpendingsApi() {
 
   if (allegro.length === 0) {
     console.log("No Allegro purchase e-mails in Inbox.");
-    if (ARCHIVE_NON_ALLEGRO_THREADS) {
-      archiveNonAllegroInboxThreads(labelProcessed, startedAt);
-    }
     return;
   }
 
@@ -102,6 +109,7 @@ function exportAllegroEmailsToSpendingsApi() {
  */
 function collectAllegroThreads(startedAt) {
   var result = [];
+  var leftovers = [];
   var start = 0;
   var complete = true;
   while (true) {
@@ -113,6 +121,8 @@ function collectAllegroThreads(startedAt) {
       var thread = threads[t];
       var subject = thread.getFirstMessageSubject() || "";
       if (!isAllegroPurchaseSubject(subject)) {
+        // contains the phrase but is not a purchase notification (e.g. a reply) - plain non-Allegro mail
+        leftovers.push(thread);
         continue;
       }
       // Purchase notifications are single-message threads, so the last message date (free, part of the
@@ -137,6 +147,10 @@ function collectAllegroThreads(startedAt) {
       complete = false;
       break;
     }
+  }
+  if (leftovers.length > 0 && ARCHIVE_NON_ALLEGRO_THREADS) {
+    archiveThreads(leftovers, GmailApp.getUserLabelByName(LABEL_PROCESSED));
+    console.log("Archived", leftovers.length, "non-purchase threads that matched the search.");
   }
   return { threads: result, complete: complete };
 }
@@ -179,33 +193,34 @@ function sendAllegroEmailToSpendingsApi(item) {
 }
 
 /**
- * Archives (and labels FE-Processed) non-Allegro Inbox threads, bounded by time and count.
- * Called only when the Inbox has no Allegro purchase e-mails left.
+ * Archives (and labels FE-Processed) every non-Allegro Inbox thread, in batches of 100 taken straight
+ * from a Gmail search - no ordering needed here. Always queries from offset 0, because archived threads
+ * drop out of the "in:inbox" result. Returns { archived, complete }; complete=false means the time
+ * budget ran out before the Inbox was clean.
  */
 function archiveNonAllegroInboxThreads(labelProcessed, startedAt) {
   var archived = 0;
-  var start = 0;
-  while (archived < MAX_OTHERS_ARCHIVED_PER_RUN && Date.now() - startedAt < MAX_RUNTIME_MS) {
-    var threads = GmailApp.getInboxThreads(start, INBOX_PAGE_SIZE);
+  while (true) {
+    if (Date.now() - startedAt > MAX_RUNTIME_MS) {
+      return { archived: archived, complete: false };
+    }
+    var threads = GmailApp.search(NON_ALLEGRO_INBOX_QUERY, 0, ARCHIVE_BATCH_SIZE);
     if (threads.length === 0) {
       break;
     }
-    var batch = [];
-    for (var t = 0; t < threads.length; t++) {
-      if (!isAllegroPurchaseSubject(threads[t].getFirstMessageSubject() || "")) {
-        batch.push(threads[t]);
-      }
+    // safety net: never archive a purchase notification even if the search matched it
+    var batch = threads.filter(function (t) { return !isAllegroPurchaseSubject(t.getFirstMessageSubject() || ""); });
+    if (batch.length === 0) {
+      break;
     }
-    if (batch.length > 0) {
-      archiveThreads(batch, labelProcessed);
-      archived += batch.length;
-    }
-    // Archived threads drop out of the Inbox listing; only skip the ones we deliberately left there.
-    start += threads.length - batch.length;
+    archiveThreads(batch, labelProcessed);
+    archived += batch.length;
+    console.log("Archived non-Allegro threads so far:", archived);
   }
   if (archived > 0) {
-    console.log("Archived", archived, "non-Allegro threads.");
+    console.log("Inbox clean-up done. Non-Allegro threads archived:", archived);
   }
+  return { archived: archived, complete: true };
 }
 
 /** Labels and archives threads in batches of 100 (Gmail batch API limit). */
