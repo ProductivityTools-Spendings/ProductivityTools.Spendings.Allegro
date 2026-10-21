@@ -1,4 +1,4 @@
-const SPENDINGS_ALLEGRO_WEBAPI_URL = "http://34.116.163.207:8086/api/allegro/emails/raw";
+const SPENDINGS_ALLEGRO_WEBAPI_URL = "https://spendings-api.productivitytools.top/api/allegro/emails/raw";
 // Purchase notifications ("Kupiłeś i zapłaciłeś: ...", "Zapłaciłeś ..."), refunds ("Zwrot 64,58 zł za zakup ...")
 // and contract withdrawals ("Potwierdzenie odstąpienia od umowy ..."). The WebApi routes them to separate tables by subject.
 const ALLEGRO_SUBJECT_PREFIXES = ["Kupiłeś i zapłaciłeś:", "Zapłaciłeś", "Zwrot ", "Potwierdzenie odstąpienia"];
